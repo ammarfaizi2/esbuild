@@ -41,11 +41,12 @@ type Msg struct {
 }
 
 type MsgLocation struct {
-	File     string
-	Line     int // 1-based
-	Column   int // 0-based, in bytes
-	Length   int // in bytes
-	LineText string
+	File      string
+	Namespace string
+	Line      int // 1-based
+	Column    int // 0-based, in bytes
+	Length    int // in bytes
+	LineText  string
 }
 
 type Loc struct {
@@ -428,7 +429,7 @@ loop:
 	return
 }
 
-func locationOrNil(source *Source, r Range) *MsgLocation {
+func LocationOrNil(source *Source, r Range) *MsgLocation {
 	if source == nil {
 		return nil
 	}
@@ -607,7 +608,7 @@ func (log Log) AddError(source *Source, loc Loc, text string) {
 	log.AddMsg(Msg{
 		Kind:     Error,
 		Text:     text,
-		Location: locationOrNil(source, Range{Loc: loc}),
+		Location: LocationOrNil(source, Range{Loc: loc}),
 	})
 }
 
@@ -615,7 +616,7 @@ func (log Log) AddWarning(source *Source, loc Loc, text string) {
 	log.AddMsg(Msg{
 		Kind:     Warning,
 		Text:     text,
-		Location: locationOrNil(source, Range{Loc: loc}),
+		Location: LocationOrNil(source, Range{Loc: loc}),
 	})
 }
 
@@ -623,7 +624,7 @@ func (log Log) AddRangeError(source *Source, r Range, text string) {
 	log.AddMsg(Msg{
 		Kind:     Error,
 		Text:     text,
-		Location: locationOrNil(source, r),
+		Location: LocationOrNil(source, r),
 	})
 }
 
@@ -631,6 +632,6 @@ func (log Log) AddRangeWarning(source *Source, r Range, text string) {
 	log.AddMsg(Msg{
 		Kind:     Warning,
 		Text:     text,
-		Location: locationOrNil(source, r),
+		Location: LocationOrNil(source, r),
 	})
 }

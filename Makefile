@@ -11,11 +11,11 @@ npm/esbuild-wasm/wasm_exec.js:
 
 # These tests are for development
 test:
-	make -j5 test-go vet-go verify-source-map end-to-end-tests js-api-tests
+	make -j6 test-go vet-go verify-source-map end-to-end-tests js-api-tests plugin-tests
 
 # These tests are for release ("test-wasm" is not included in "test" because it's pretty slow)
 test-all:
-	make -j6 test-go vet-go verify-source-map end-to-end-tests js-api-tests test-wasm
+	make -j7 test-go vet-go verify-source-map end-to-end-tests js-api-tests plugin-tests test-wasm
 
 # This includes tests of some 3rd-party libraries, which can be very slow
 test-extra: test-all test-preact-splitting test-sucrase bench-rome-esbuild test-esprima test-rollup
@@ -40,6 +40,9 @@ end-to-end-tests: | scripts/node_modules
 
 js-api-tests: | scripts/node_modules
 	node scripts/js-api-tests.js
+
+plugin-tests: | scripts/node_modules
+	node scripts/plugin-tests.js
 
 update-version-go:
 	node -e 'console.log(`package main\n\nconst esbuildVersion = "$(ESBUILD_VERSION)"`)' > cmd/esbuild/version.go

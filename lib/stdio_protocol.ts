@@ -8,10 +8,18 @@ import * as types from "./types";
 
 export interface BuildRequest {
   command: 'build';
+  key: number;
   flags: string[];
   write: boolean;
   stdin: string | null;
   resolveDir: string | null;
+  plugins?: BuildPlugin[];
+}
+
+export interface BuildPlugin {
+  name: string;
+  resolvers: { id: number, filter: string }[];
+  loaders: { id: number, filter: string, namespace: string }[];
 }
 
 export interface BuildResponse {
@@ -36,6 +44,38 @@ export interface TransformResponse {
 
   jsSourceMap: string;
   jsSourceMapFS: boolean;
+}
+
+export interface ResolverRequest {
+  command: 'resolver';
+  key: number;
+  id: number;
+  path: string;
+  importDir: string;
+}
+
+export interface ResolverResponse {
+  errors?: types.PartialMessage[];
+  warnings?: types.PartialMessage[];
+
+  path?: string;
+  external?: boolean;
+  namespace?: string;
+}
+
+export interface LoaderRequest {
+  command: 'loader';
+  key: number;
+  id: number;
+  path: string;
+}
+
+export interface LoaderResponse {
+  errors?: types.PartialMessage[];
+  warnings?: types.PartialMessage[];
+
+  contents?: Uint8Array;
+  loader?: string;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

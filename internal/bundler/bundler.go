@@ -68,7 +68,6 @@ type parseArgs struct {
 	res             resolver.Resolver
 	keyPath         logger.Path
 	prettyPath      string
-	baseName        string
 	sourceIndex     uint32
 	importSource    *logger.Source
 	flags           parseFlags
@@ -92,50 +91,39 @@ type parseResult struct {
 
 func parseFile(args parseArgs) {
 	source := logger.Source{
-		Index:      args.sourceIndex,
-		KeyPath:    args.keyPath,
-		PrettyPath: args.prettyPath,
-	}
-
-	// Try to determine the identifier name by the absolute path, since it may
-	// need to look at the parent directory. But make sure to not treat the key
-	// as a file system path if it's not marked as one.
-	if args.keyPath.Namespace == "file" {
-		source.IdentifierName = ast.GenerateNonUniqueNameFromPath(args.keyPath.Text)
-	} else {
-		source.IdentifierName = ast.GenerateNonUniqueNameFromPath(args.baseName)
+		Index:          args.sourceIndex,
+		KeyPath:        args.keyPath,
+		PrettyPath:     args.prettyPath,
+		IdentifierName: ast.GenerateNonUniqueNameFromPath(args.keyPath.Text),
 	}
 
 	var loader config.Loader
-	stdin := args.options.Stdin
 
-	if stdin != nil {
+	if stdin := args.options.Stdin; stdin != nil {
 		// Special-case stdin
 		source.Contents = stdin.Contents
-		source.PrettyPath = "<stdin>"
 		if stdin.SourceFile != "" {
 			source.PrettyPath = stdin.SourceFile
 		}
 		loader = stdin.Loader
-	} else if args.keyPath.Namespace == "file" {
-		// Read normal modules from disk
-		var err error
-		source.Contents, err = args.fs.ReadFile(args.keyPath.Text)
-		if err != nil {
-			if err == syscall.ENOENT {
-				args.log.AddRangeError(args.importSource, args.importPathRange,
-					fmt.Sprintf("Could not read from file: %s", args.keyPath.Text))
-			} else {
-				args.log.AddRangeError(args.importSource, args.importPathRange,
-					fmt.Sprintf("Cannot read file %q: %s", args.res.PrettyPath(args.keyPath), err.Error()))
-			}
+		if loader == config.LoaderNone {
+			loader = config.LoaderJS
+		}
+	} else {
+		var ok bool
+		loader, ok = runLoaderPlugins(
+			args.options.LoaderPlugins,
+			args.res,
+			args.fs,
+			args.log,
+			&source,
+			args.importSource,
+			args.importPathRange,
+		)
+		if !ok {
 			args.results <- parseResult{}
 			return
 		}
-		loader = loaderFromFileExtension(args.options.ExtensionToLoader, args.baseName)
-	} else if source.KeyPath.Namespace == resolver.BrowserFalseNamespace {
-		// Force disabled modules to be empty
-		loader = config.LoaderJS
 	}
 
 	// Allow certain properties to be overridden
@@ -147,6 +135,12 @@ func parseFile(args parseArgs) {
 	}
 	if args.flags.strictClassFields {
 		args.options.Strict.ClassFields = true
+	}
+
+	// The special "default" loader determines the loader from the file path
+	baseName := args.fs.Base(args.keyPath.Text)
+	if loader == config.LoaderDefault {
+		loader = loaderFromFileExtension(args.options.ExtensionToLoader, baseName)
 	}
 
 	result := parseResult{
@@ -199,7 +193,7 @@ func parseFile(args parseArgs) {
 		result.file.ignoreIfUnused = true
 
 	case config.LoaderDataURL:
-		mimeType := mime.TypeByExtension(args.fs.Ext(args.baseName))
+		mimeType := mime.TypeByExtension(args.fs.Ext(baseName))
 		if mimeType == "" {
 			mimeType = http.DetectContentType([]byte(source.Contents))
 		}
@@ -213,14 +207,14 @@ func parseFile(args parseArgs) {
 		// Add a hash to the file name to prevent multiple files with the same name
 		// but different contents from colliding
 		hash := hashForFileName([]byte(source.Contents))
-		ext := path.Ext(args.baseName)
-		baseName := args.baseName[:len(args.baseName)-len(ext)] + "." + hash + ext
+		ext := path.Ext(baseName)
+		additionalFileName := baseName[:len(baseName)-len(ext)] + "." + hash + ext
 
 		// Determine the destination folder
 		targetFolder := args.options.AbsOutputDir
 
 		// Export the resulting relative path as a string
-		expr := ast.Expr{Data: &ast.EString{Value: lexer.StringToUTF16(baseName)}}
+		expr := ast.Expr{Data: &ast.EString{Value: lexer.StringToUTF16(additionalFileName)}}
 		result.file.ast = parser.LazyExportAST(args.log, source, args.options, expr, "")
 		result.file.ignoreIfUnused = true
 
@@ -234,7 +228,7 @@ func parseFile(args parseArgs) {
 		// Copy the file using an additional file payload to make sure we only copy
 		// the file if the module isn't removed due to tree shaking.
 		result.file.additionalFile = &OutputFile{
-			AbsPath:           args.fs.Join(targetFolder, baseName),
+			AbsPath:           args.fs.Join(targetFolder, additionalFileName),
 			Contents:          []byte(source.Contents),
 			jsonMetadataChunk: jsonMetadataChunk,
 		}
@@ -242,7 +236,7 @@ func parseFile(args parseArgs) {
 	default:
 		result.ok = false
 		args.log.AddRangeError(args.importSource, args.importPathRange,
-			fmt.Sprintf("File extension not supported: %s", args.prettyPath))
+			fmt.Sprintf("File could not be loaded: %s", source.PrettyPath))
 	}
 
 	// Stop now if parsing failed
@@ -259,17 +253,6 @@ func parseFile(args parseArgs) {
 		if len(result.file.ast.ImportRecords) > 0 {
 			cacheRequire := make(map[string]*resolver.ResolveResult)
 			cacheImport := make(map[string]*resolver.ResolveResult)
-
-			// Resolve relative to the parent directory of the source file with the
-			// import path. Just use the current directory if the source file is virtual.
-			var sourceDir string
-			if source.KeyPath.Namespace == "file" {
-				sourceDir = args.fs.Dir(source.KeyPath.Text)
-			} else if args.absResolveDir != "" {
-				sourceDir = args.absResolveDir
-			} else {
-				sourceDir = args.fs.Cwd()
-			}
 
 			for _, part := range result.file.ast.Parts {
 				for _, importRecordIndex := range part.ImportRecordIndices {
@@ -290,7 +273,17 @@ func parseFile(args parseArgs) {
 					}
 
 					// Run the resolver and log an error if the path couldn't be resolved
-					resolveResult := args.res.Resolve(sourceDir, record.Path.Text, record.Kind)
+					resolveResult, didLogError := runResolverPlugins(
+						args.options.ResolverPlugins,
+						args.res,
+						args.log,
+						args.fs,
+						&source,
+						source.RangeOfString(record.Loc),
+						record.Path.Text,
+						record.Kind,
+						args.absResolveDir,
+					)
 					cache[record.Path.Text] = resolveResult
 
 					if resolveResult == nil {
@@ -298,7 +291,7 @@ func parseFile(args parseArgs) {
 						// external imports instead of causing errors. This matches a common
 						// code pattern for conditionally importing a module with a graceful
 						// fallback.
-						if !record.IsInsideTryBody {
+						if !didLogError && !record.IsInsideTryBody {
 							r := source.RangeOfString(record.Loc)
 							hint := ""
 							if args.options.Platform != config.PlatformNode {
@@ -375,6 +368,184 @@ func extractSourceMapFromComment(log logger.Log, fs fs.FS, res resolver.Resolver
 	// Anything else is unsupported
 	log.AddRangeWarning(source, comment.Range, "Unsupported source map comment")
 	return logger.Path{}, nil
+}
+
+func logPluginMessages(
+	res resolver.Resolver,
+	log logger.Log,
+	name string,
+	msgs []logger.Msg,
+	thrown error,
+	importSource *logger.Source,
+	importPathRange logger.Range,
+) bool {
+	didLogError := false
+
+	// Report errors and warnings generated by the plugin
+	for _, msg := range msgs {
+		if name != "" {
+			msg.Text = fmt.Sprintf("[%s] %s", name, msg.Text)
+		}
+		if msg.Kind == logger.Error {
+			didLogError = true
+		}
+
+		// Sanitize the location
+		if msg.Location != nil {
+			clone := *msg.Location
+			if clone.Namespace == "" {
+				clone.Namespace = "file"
+			}
+			if clone.File == "" {
+				clone.File = importSource.PrettyPath
+			} else {
+				clone.File = res.PrettyPath(logger.Path{Text: clone.File, Namespace: clone.Namespace})
+			}
+			msg.Location = &clone
+		} else {
+			msg.Location = logger.LocationOrNil(importSource, importPathRange)
+		}
+
+		log.AddMsg(msg)
+	}
+
+	// Report errors thrown by the plugin itself
+	if thrown != nil {
+		didLogError = true
+		text := thrown.Error()
+		if name != "" {
+			text = fmt.Sprintf("[%s] %s", name, text)
+		}
+		log.AddRangeError(importSource, importPathRange, text)
+	}
+
+	return didLogError
+}
+
+func runResolverPlugins(
+	plugins []config.ResolverPlugin,
+	res resolver.Resolver,
+	log logger.Log,
+	fs fs.FS,
+	importSource *logger.Source,
+	importPathRange logger.Range,
+	path string,
+	kind ast.ImportKind,
+	absResolveDir string,
+) (*resolver.ResolveResult, bool) {
+	// Resolve relative to the parent directory of the source file with the
+	// import path. Just use the current directory if the source file is virtual.
+	var importDir string
+	if importSource.KeyPath.Namespace == "file" {
+		importDir = fs.Dir(importSource.KeyPath.Text)
+	} else if absResolveDir != "" {
+		importDir = absResolveDir
+	} else {
+		importDir = fs.Cwd()
+	}
+
+	resolverArgs := config.ResolverArgs{
+		Path:      path,
+		ImportDir: importDir,
+	}
+
+	// Apply resolver plugins in order until one succeeds
+	for _, plugin := range plugins {
+		if !plugin.Filter.MatchString(path) {
+			continue
+		}
+
+		result := plugin.Callback(resolverArgs)
+		didLogError := logPluginMessages(res, log, plugin.Name, result.Msgs, result.ThrownError, importSource, importPathRange)
+
+		// Stop now if there was an error
+		if didLogError {
+			return nil, true
+		}
+
+		// Otherwise, continue on to the next resolver if this loader didn't succeed
+		if result.Path.Text == "" {
+			if result.External {
+				result.Path = logger.Path{Text: path}
+			} else {
+				continue
+			}
+		}
+
+		return &resolver.ResolveResult{
+			PathPair:   resolver.PathPair{Primary: result.Path},
+			IsExternal: result.External,
+		}, false
+	}
+
+	return res.Resolve(importDir, path, kind), false
+}
+
+func runLoaderPlugins(
+	plugins []config.LoaderPlugin,
+	res resolver.Resolver,
+	fs fs.FS,
+	log logger.Log,
+	source *logger.Source,
+	importSource *logger.Source,
+	importPathRange logger.Range,
+) (config.Loader, bool) {
+	loaderArgs := config.LoaderArgs{Path: source.KeyPath}
+
+	// Apply loader plugins in order until one succeeds
+	for _, plugin := range plugins {
+		if source.KeyPath.Namespace != plugin.Namespace {
+			continue
+		}
+
+		if !plugin.Filter.MatchString(source.KeyPath.Text) {
+			continue
+		}
+
+		result := plugin.Callback(loaderArgs)
+		didLogError := logPluginMessages(res, log, plugin.Name, result.Msgs, result.ThrownError, importSource, importPathRange)
+
+		// Stop now if there was an error
+		if didLogError {
+			return config.LoaderNone, false
+		}
+
+		// Otherwise, continue on to the next loader if this loader didn't succeed
+		if result.Contents == nil {
+			continue
+		}
+
+		source.Contents = *result.Contents
+		loader := result.Loader
+		if loader == config.LoaderNone {
+			loader = config.LoaderJS
+		}
+		return loader, true
+	}
+
+	// Read normal modules from disk
+	if source.KeyPath.Namespace == "file" {
+		if contents, err := fs.ReadFile(source.KeyPath.Text); err == nil {
+			source.Contents = contents
+			return config.LoaderDefault, true
+		} else if err == syscall.ENOENT {
+			log.AddRangeError(importSource, importPathRange,
+				fmt.Sprintf("Could not read from file: %s", source.KeyPath.Text))
+			return config.LoaderNone, false
+		} else {
+			log.AddRangeError(importSource, importPathRange,
+				fmt.Sprintf("Cannot read file %q: %s", res.PrettyPath(source.KeyPath), err.Error()))
+			return config.LoaderNone, false
+		}
+	}
+
+	// Force disabled modules to be empty
+	if source.KeyPath.Namespace == resolver.BrowserFalseNamespace {
+		return config.LoaderJS, true
+	}
+
+	// Otherwise, fail to load the path
+	return config.LoaderNone, true
 }
 
 func loaderFromFileExtension(extensionToLoader map[string]config.Loader, base string) config.Loader {
@@ -470,7 +641,6 @@ func ScanBundle(log logger.Log, fs fs.FS, res resolver.Resolver, entryPaths []st
 				res:             res,
 				keyPath:         path,
 				prettyPath:      prettyPath,
-				baseName:        fs.Base(path.Text),
 				sourceIndex:     sourceIndex,
 				importSource:    importSource,
 				flags:           flags,
